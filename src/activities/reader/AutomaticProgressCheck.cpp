@@ -14,18 +14,14 @@
 
 namespace {
 
-// Headless, bounded WiFi connect: try each saved credential once, then give up.
-// Mirrors WifiSelectionActivity's auto-connect path but blocks (this runs in a
-// dedicated task, not the activity loop).
-bool connectHeadless() {
+// Association only. The radio is brought up by start() on the main loop task:
+// WiFi.mode() blocks forever when called from a secondary task, and every other
+// WiFi bring-up in this codebase runs on the main task for the same reason.
+// Polls stopRequested so a destructing owner can reclaim the task promptly.
+bool connectHeadless(const std::atomic<bool>& stopRequested) {
   if (WiFi.status() == WL_CONNECTED) return true;
 
   const uint32_t deadline = millis() + AutomaticWifiConnectionPolicy::BACKGROUND_TIMEOUT_MS;
-
-  WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);  // Abort any SDK auto-connect and clear NVS SSID
-  vTaskDelay(pdMS_TO_TICKS(100));
 
   for (size_t i = 0; i < WIFI_STORE.getCredentialCount(); i++) {
     const auto cred = WIFI_STORE.getCredentialAt(i);
@@ -45,6 +41,7 @@ bool connectHeadless() {
                                                          AutomaticWifiConnectionPolicy::FALLBACK_ATTEMPT_TIMEOUT_MS);
     const uint32_t attemptStartedAt = millis();
     while (millis() - attemptStartedAt < attemptTimeoutMs) {
+      if (stopRequested.load(std::memory_order_acquire)) return false;
       if (WiFi.status() == WL_CONNECTED) {
         LOG_DBG("KOSync", "Automatic check: connected to %s", cred->ssid.c_str());
         return true;
@@ -59,8 +56,20 @@ bool connectHeadless() {
 }  // namespace
 
 AutomaticProgressCheck::~AutomaticProgressCheck() {
-  if (taskHandle_ && status_.load(std::memory_order_acquire) == Status::RUNNING) {
-    vTaskDelete(taskHandle_);
+  stopRequested_.store(true, std::memory_order_release);
+
+  // Never vTaskDelete() here. The task may hold storageMutex (loadFromFile) or
+  // be inside a wolfSSL handshake; killing it there strands the mutex and every
+  // subsequent SD access blocks on it forever, freezing the device.
+  const TickType_t startedAt = xTaskGetTickCount();
+  while (!taskExited_.load(std::memory_order_acquire) &&
+         (xTaskGetTickCount() - startedAt) < pdMS_TO_TICKS(TASK_JOIN_TIMEOUT_MS)) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  if (!taskExited_.load(std::memory_order_acquire)) {
+    // Leaking the task is still better than a stranded storage mutex.
+    LOG_ERR("KOSync", "Automatic check task did not exit within %u ms", TASK_JOIN_TIMEOUT_MS);
   }
   taskHandle_ = nullptr;
 }
@@ -72,10 +81,20 @@ bool AutomaticProgressCheck::start(const std::string& epubPath) {
   epubPath_ = epubPath;
   remoteProgress_ = {};
   error_ = KOReaderSyncClient::OK;
+  stopRequested_.store(false, std::memory_order_release);
+  taskExited_.store(false, std::memory_order_release);
+
+  // Bring the radio up here, on the main loop task. WiFi.mode() never returns
+  // when called from a secondary task, which hung the reader on book open.
+  WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);  // Abort any SDK auto-connect and clear NVS SSID
+
   status_.store(Status::RUNNING, std::memory_order_release);
 
   if (xTaskCreatePinnedToCore(&taskTrampoline, "AutoProgressCheck", 8192, this, 1, &taskHandle_, 0) != pdPASS) {
     LOG_ERR("KOSync", "Failed to create automatic progress check task");
+    taskExited_.store(true, std::memory_order_release);
     status_.store(Status::DONE_ERROR, std::memory_order_release);
     error_ = KOReaderSyncClient::NETWORK_ERROR;
     taskHandle_ = nullptr;
@@ -87,6 +106,7 @@ bool AutomaticProgressCheck::start(const std::string& epubPath) {
 void AutomaticProgressCheck::taskTrampoline(void* arg) {
   auto* self = static_cast<AutomaticProgressCheck*>(arg);
   self->run();
+  self->taskExited_.store(true, std::memory_order_release);
   vTaskDelete(nullptr);  // never touches self after this point
 }
 
@@ -96,7 +116,12 @@ void AutomaticProgressCheck::run() {
   // without that activity, so it must load them itself.)
   WIFI_STORE.loadFromFile();
 
-  if (!connectHeadless()) {
+  if (stopRequested_.load(std::memory_order_acquire)) {
+    status_.store(Status::DONE_ERROR, std::memory_order_release);
+    return;
+  }
+
+  if (!connectHeadless(stopRequested_)) {
     LOG_DBG("KOSync", "Automatic check: WiFi unavailable");
     error_ = KOReaderSyncClient::NETWORK_ERROR;
     status_.store(Status::DONE_ERROR, std::memory_order_release);
@@ -114,7 +139,9 @@ void AutomaticProgressCheck::run() {
   }
 
   KOReaderProgress progress;
-  const auto result = KOReaderSyncClient::getProgress(hash, progress);
+  const auto result =
+      KOReaderSyncClient::getProgress(hash, progress, KOReaderSyncClient::DEFAULT_REQUEST_TIMEOUT_MS,
+                                      [this] { return stopRequested_.load(std::memory_order_acquire); });
   error_ = result;
 
   // Drop the radio; the reader resumes normal low-power operation.

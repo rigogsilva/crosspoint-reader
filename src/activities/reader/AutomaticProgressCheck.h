@@ -57,8 +57,15 @@ class AutomaticProgressCheck {
   static void taskTrampoline(void* arg);
   void run();
 
+  // The task can be inside HalStorage or wolfSSL, so the destructor asks it to
+  // stop and waits. Killing it outright would strand storageMutex and deadlock
+  // every later SD access. Abort checks keep the real wait far below this.
+  static constexpr uint32_t TASK_JOIN_TIMEOUT_MS = 5000;
+
   TaskHandle_t taskHandle_ = nullptr;
   std::atomic<Status> status_{Status::IDLE};
+  std::atomic<bool> stopRequested_{false};
+  std::atomic<bool> taskExited_{true};  // true whenever no task is running
   std::string epubPath_;
   KOReaderProgress remoteProgress_;
   KOReaderSyncClient::Error error_ = KOReaderSyncClient::OK;
