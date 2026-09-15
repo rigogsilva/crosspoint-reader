@@ -151,6 +151,15 @@ static bool deepSleepInProgress = false;
 static bool deferredSleepPending = false;
 static bool deferredSleepCompletionRequested = false;
 static bool deferredSleepFromTimeout = false;
+static uint32_t deferredSleepStartedAt = 0;
+
+// Upper bound on a deferred sleep. The deferring path is the automatic KOReader
+// sync, whose own budget is AutomaticWifiConnectionPolicy::BACKGROUND_TIMEOUT_MS
+// (15s); this is deliberately longer so the normal flow always wins the race. If
+// completeDeferredDeepSleep() is never reached the loop would otherwise service
+// only the sync workflow forever, leaving the device stuck on the sleep screen
+// with input suppressed.
+static constexpr uint32_t DEFERRED_SLEEP_TIMEOUT_MS = 30000;
 
 #if FREEINK_CAP_TOUCH
 static bool finishWifiSessionWithoutRestart() {
@@ -313,6 +322,10 @@ void enterDeepSleep(const bool fromTimeout) {
   const bool isQuickResumeSleep = prepareSleepState(fromTimeout);
   if (activityManager.prepareForSleep(fromTimeout)) {
     deferredSleepPending = true;
+    deferredSleepStartedAt = millis();
+    // Seed the reason so the timeout path below sleeps with the correct intent
+    // even when completeDeferredDeepSleep() never runs.
+    deferredSleepFromTimeout = fromTimeout;
     activityManager.showSleepScreen(fromTimeout);
     if (isQuickResumeSleep) {
       saveSleepFrameBuffer();
@@ -640,6 +653,14 @@ void loop() {
   // The sleep screen is already visible. Keep servicing only the queued sync
   // workflow until it requests completion; ignore input and repeated timeouts.
   if (deferredSleepPending) {
+    // Unsigned arithmetic keeps this correct across millis() rollover.
+    if (millis() - deferredSleepStartedAt >= DEFERRED_SLEEP_TIMEOUT_MS) {
+      LOG_ERR("MAIN", "Deferred sleep timed out after %u ms; sleeping anyway", DEFERRED_SLEEP_TIMEOUT_MS);
+      deferredSleepCompletionRequested = false;
+      deferredSleepPending = false;
+      commitDeepSleep(deferredSleepFromTimeout, false);
+      return;
+    }
     activityManager.loop();
     delay(10);
     return;
