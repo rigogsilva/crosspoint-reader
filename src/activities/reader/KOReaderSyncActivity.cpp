@@ -582,6 +582,14 @@ void KOReaderSyncActivity::onEnter() {
   if (prefetchedResult) {
     hasRemoteProgress = true;
     ensureEpubLoaded();  // needed for the chapter title in the result screen
+    // The reload competes with the WiFi stack the check just brought up, so it
+    // can fail on a low heap. buildResultScreen() dereferences epub, so return
+    // to the reader instead of rendering the result.
+    if (!epub) {
+      LOG_ERR("KOSync", "Epub reload failed after automatic check; skipping result screen");
+      completeFlow();
+      return;
+    }
     {
       RenderLock lock(*this);
       state = SHOWING_RESULT;
